@@ -7,11 +7,11 @@ from dcim.models import Device
 
 
 class Command(BaseCommand):
-    help = '同步虚拟化群集中的虚拟机'
+    help = '根据名称中的IP地址修复虚拟机的IP'
 
-    def add_arguments(self, parser: CommandParser) -> None:
-        parser.add_argument('--list', action='store_true', dest='list', help='列出当前虚拟机群集')
-        parser.add_argument('--clusters', nargs='+', dest='clusters', help='指定要同步的群集名')
+    # def add_arguments(self, parser: CommandParser) -> None:
+    #     parser.add_argument('--list', action='store_true', dest='list', help='列出当前虚拟机群集')
+    #     parser.add_argument('--clusters', nargs='+', dest='clusters', help='指定要同步的群集名')
 
     def print_msg(self, msg: str, level:str=""):
         if level == "success":
@@ -87,27 +87,6 @@ class Command(BaseCommand):
                         self.print_msg(f"🐛 Found {vm_in_db.count()} VMs in DB by search: {vm['name']}, skip", "warning")
 
     def handle(self, *args, **options):
-        print(f"args: {args}")
-        print(f"options: {options}")
-        print(options.values())
-        print(any(options.values()))
-
-        # 排除 verbosity，检查是否有自定义参数被提供
-        custom_options = {k: v for k, v in options.items() if k not in ['verbosity', 'settings', 'pythonpath']}
-        if not any(custom_options.values()):
-            self.print_help('manage.py', 'sync_inspur')
-            return
-
-
-        if options["list"]:
-            self.stdout.write(self.style.SUCCESS("Current Clusters:"))
-            clusters = Cluster.objects.all()
-            for cluster in clusters:
-                print(f"{cluster}")
-        elif options['clusters']:
-            clusters = options['clusters']
-            self.sync_cluster(clusters)
-            # self.stdout.write(self.style.SUCCESS(f'Syncing data for clusters: {", ".join(clusters)}'))
-
+        self.print_msg(VirtualMachine.objects.count(), "success")
 
         self.stdout.write(self.style.SUCCESS("Done"))
