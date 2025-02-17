@@ -51,7 +51,7 @@ class Command(BaseCommand):
                         ip_obj = IPAddress.objects.get(address=host_ip_address)
                         interface = ip_obj.assigned_object
     
-                        # 检查接口是否存在并且是否关联到设备
+                        # 检查接口是否存在并且是否关联到物理设备
                         if interface and hasattr(interface, 'device'):
                             device = interface.device
 
@@ -67,11 +67,14 @@ class Command(BaseCommand):
 
                                 try:
                                     ip = vm['ip']
-                                    try:
-                                        ipaddr, created = IPAddress.objects.get_or_create(address=ip)
-                                    except IPAddress.MultipleObjectsReturned:
-                                        ipaddr = IPAddress.objects.filter(address=ip).first()
-                                    vm_instance.primary_ip4 = ipaddr
+                                    # try:
+                                    #     ipaddr, created = IPAddress.objects.get_or_create(address=ip)
+                                    # except IPAddress.MultipleObjectsReturned:
+                                    #     ipaddr = IPAddress.objects.filter(address=ip).first()
+                                    # vm_instance.primary_ip4 = ipaddr
+
+                                    # IP地址文本存放在描述里(临时)
+                                    vm_instance.description = ip
 
                                 except KeyError:
                                     self.print_msg(f"🐛 IP address for VM({vm['name']}) not found, skip", "warning")
