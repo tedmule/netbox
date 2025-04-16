@@ -31,17 +31,17 @@ class Command(BaseCommand):
     def sync_cluster(self, clusters: list):
         for cluster in Cluster.objects.filter(name__in=clusters):
             cluster_type = cluster.type.name.lower()
-            print(f"----cluster type: {cluster_type}")
+            self.print_msg(f"cluster type: {cluster_type}", "success")
             device_count = cluster.devices.count()
             self.print_msg(f"🐛 Found {device_count} devices in cluster({cluster})")
 
             if device_count == 0:
                 self.print_msg(f"{cluster.name} 群集中未找到设备", "warning")
                 continue
-
             
             # 浪潮云未找到可用API使用爬虫逻辑
             if cluster_type == 'inspur':
+                self.print_msg(f"Sync VMs using from {cluster}")
                 vms = sync_inspur()
                 self.print_msg(f"Found {len(vms)} VMs from Inspur cloud", "success")
 
@@ -57,9 +57,11 @@ class Command(BaseCommand):
 
                             # 以下为浪潮虚拟机添加逻辑
                             # vm_in_db = VirtualMachine.objects.filter(cluster=cluster, name__contains=vm['name'])
-                            vm_in_db = VirtualMachine.objects.filter(cluster=cluster, name=vm['name'])
+                            # vm_in_db = VirtualMachine.objects.filter(cluster=cluster, name=vm['name'], )
+                            vm_in_db = VirtualMachine.objects.filter(cluster=cluster, description__contains=vm['ip'], )
+
                             if vm_in_db.count() == 0:
-                                self.print_msg(f"VM({vm['name']}) not found in DB, adding")
+                                self.print_msg(f"VM({vm['name']}) with IP({vm['ip']}) not found in DB, adding")
 
                                 vm_instance = VirtualMachine()
                                 vm_instance.name = vm['name']
@@ -77,7 +79,7 @@ class Command(BaseCommand):
                                     vm_instance.description = ip
 
                                 except KeyError:
-                                    self.print_msg(f"🐛 IP address for VM({vm['name']}) not found, skip", "warning")
+                                    self.print_msg(f"🐛 IP address for VM({vm['name']}, retrieved from Inspur API) not found, skip", "warning")
 
                                 if vm.get('vcpus', 0):
                                     vm_instance.vcpus = vm['vcpus']
@@ -88,21 +90,32 @@ class Command(BaseCommand):
                                 vm_instance.device = device
                                 vm_instance.save()
                             else:
-                                self.print_msg(f"🐛 Found {vm_in_db.count()} VMs in DB by search: {vm['name']}, skip", "warning")
-
+                                # IF multiple VMs found, skip adding
+                                if vm_in_db.count() > 1:
+                                    self.print_msg(f"Found multiple VMs from netbox database by IP({vm['IP']}), skip", "warning")
+                                else:
+                                    for vm_inst in vm_in_db:
+                                        if vm_inst.name != vm['name']:
+                                            self.print_msg(f"Name of VM({vm_inst.name}: {vm_inst.description}[Database]) is different from VM({vm['name']}: {vm['ip']}[Cloud]), update", "warning")
+                                            vm_inst.name = vm['name']
+                                            vm_inst.save()
                         else:
-                            self.print_msg(f"🐛 Device with IP address({host_ip_address}) not found, skip", "warning")
+                            self.print_msg(f"Device with IP address({host_ip_address}) not found, skip", "warning")
                     except IPAddress.DoesNotExist:
-                        self.print_msg(f"🐛 Device IP address not found {host_ip_address}, skip", "warning")
+                        self.print_msg(f"Device IP address not found {host_ip_address}, skip", "warning")
                         continue
 
-                    # ipv4 = IPAddress()
-                    # ipv4.address=f"{vm['host']}/24"
-                    # print(ipv4)
+                # Print stale VMs(possible)
+                cloud_vms = set([cloud_vm['name'] for cloud_vm in vms])
+                db_vms = set([db_vm.name for db_vm in VirtualMachine.objects.filter(cluster=cluster)])
 
-                    # device = Device.objects.filter(primary_ip4=ipv4)
-                    # print(f"----: {device}")
-                # Sync VMS from Inspur Cloud
+                if len(cloud_vms) > len(db_vms):
+                    print(f"🐛🐛🐛 STALE VMs: {cloud_vms - db_vms}")
+                else:
+                    print(f"🐛🐛🐛 STALE VMs: {db_vms - cloud_vms}")
+
+            
+            # 浪潮虚拟化之外的虚拟化同步逻辑
             else:
                 for device in cluster.devices.all():
                     if not device.name:
