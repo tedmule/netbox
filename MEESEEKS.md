@@ -8,3 +8,6 @@ export INSPUR_CLOUD_URL=https://192.168.20.38
 export INSPUR_CLOUD_ACCESS_KEY=access_key
 export INSPUR_CLOUD_ACCESS_SECRET=access_secret
 ```
+
+emoji
+🐞🐛

@@ -1,16 +1,13 @@
 from django.core.management.base import BaseCommand, CommandError, CommandParser
-from django.db.models import Q
-from django.db.utils import IntegrityError
 from virtualization.utils.vmware import sync_vmware
 from virtualization.utils.xen import sync_xen
 from virtualization.utils.kvm import sync_kvm
-from virtualization.utils.inspur import sync_inspur, update_inspur_vm
+from virtualization.utils.inspur import sync_inspur, update_inspur_vm, fetch_vms_form_inspur_cloud
 from virtualization.utils.util import get_auth_from_comments, extract_ip
 from virtualization.models import VirtualMachine
 from virtualization.models import Cluster
 from dcim.models import Device
 from ipam.models import IPAddress
-
 
 
 class Command(BaseCommand):
@@ -20,7 +17,7 @@ class Command(BaseCommand):
         parser.add_argument('--list', action='store_true', dest='list', help='列出当前虚拟机群集')
         parser.add_argument('--clusters', nargs='+', dest='clusters', help='指定要同步的群集名')
 
-    def print_msg(self, msg: str, level:str=""):
+    def print_msg(self, msg: str, level: str = ""):
         if level == "success":
             self.stdout.write(self.style.SUCCESS(msg))
         elif level == "warning":
@@ -40,121 +37,23 @@ class Command(BaseCommand):
             if device_count == 0:
                 self.print_msg(f"{cluster.name} 群集中未找到设备", "warning")
                 continue
-            
+
             if cluster_type == 'inspur':
-                self.print_msg(f"Sync VMs using Inspur API from {cluster}")
-                vms = sync_inspur()
-                self.print_msg(f"Found {len(vms)} VMs from Inspur cloud", "success")
-
-                # Variable(tmp) to store vm instance in database
-                vm_inst = VirtualMachine()
-                # counter
-                updated_count = 0
-                created_count = 0
-                ignored_count = 0
-                for vm in vms:
-                    host_ip_address = f"{vm['host']}/24"
-                    try:
-                        ip_obj = IPAddress.objects.get(address=host_ip_address)
-                        interface = ip_obj.assigned_object
-    
-                        # 检查接口是否存在并且是否关联到物理设备
-                        if interface and hasattr(interface, 'device'):
-                            device = interface.device
-
-                            # 以下为浪潮虚拟机添加逻辑
-                            vm_name = vm['name']
-                            vm_ip = vm['ip']
-
-                            try:
-                                ipaddr, created = IPAddress.objects.get_or_create(address=vm_ip)
-                            except IPAddress.MultipleObjectsReturned:
-                                # Potential issue when there are 10.10.10.10/32 and 10.10.10.10/24 in database
-                                ipaddr = IPAddress.objects.filter(address=vm_ip).first()
-
-                            # Try find VM by name, ip address in description or ip address equals primary_ip4
-                            vm_in_db = VirtualMachine.objects.filter(
-                                Q(name__icontains=vm_name) | 
-                                # Q(description__icontains=vm_ip) |
-                                Q(primary_ip4=ipaddr), 
-                                cluster=cluster)
-
-                            if vm_in_db.count() == 0:
-                                self.print_msg(f"Inspur cloud VM({vm_name}) with IP({vm_ip}) not found in DB, ADDING", "warning")
-
-                                vm_instance = VirtualMachine()
-                                vm_instance.name = vm_name
-                                vm_instance.status = vm['status']
-
-                                # IP地址文本存放在描述里(临时兼容)
-                                vm_instance.description = vm_ip
-                                vm_instance.primary_ip4 = ipaddr
-
-                                if vm.get('vcpus', 0):
-                                    vm_instance.vcpus = vm['vcpus']
-                                if vm.get('memory', 0):
-                                    vm_instance.memory = vm['memory']
-                                vm_instance.cluster = cluster
-                                # Bind vm to device(physical machine)
-                                vm_instance.device = device
-                                vm_instance.save()
-                                created_count += 1
-
-                            elif vm_in_db.count() > 1:
-                                self.print_msg(f"Found multiple VMs(count: {vm_in_db.count()}) from netbox database by {vm_name}(IP: {vm_ip}), checking", "warning")
-                                print(vm_in_db)
-
-                                ignored = True
-                                for dup_vm in vm_in_db:
-                                    if dup_vm.primary_ip4 and (vm_ip == str(dup_vm.primary_ip4.address.ip)) and vm_name == dup_vm.name:
-                                        self.print_msg(f"Matched VM {dup_vm.name}(IP: {vm_ip}) by primary_ip4 ", "success")
-                                        count = update_inspur_vm(dup_vm, vm, ipaddr)
-                                        updated_count += count
-                                        ignored = False
-                                        break
-                                    elif vm_ip in dup_vm.description and vm_name == dup_vm.name:
-                                        self.print_msg(f"Matched VM {dup_vm.name}(IP: {vm_ip}) by description", "success")
-                                        count = update_inspur_vm(dup_vm, vm, ipaddr)
-                                        updated_count += count
-                                        ignored = False
-                                        break
-                                if ignored:
-                                    ignored_count += 1
-                            else:
-                                # Found 1 VM from netbox database, update
-                                vm_inst = vm_in_db.first()
-                                count = update_inspur_vm(vm_inst, vm, ipaddr)
-                                updated_count += count
-                        else:
-                            self.print_msg(f"Device with IP address({host_ip_address}) not found, skip", "warning")
-                    except IPAddress.DoesNotExist:
-                        self.print_msg(f"Device IP address not found {host_ip_address}, skip", "warning")
-                        continue
-                    except KeyError as err:
-                        self.print_msg(f"KeyError when processing {vm}, skip", "error")
-                        continue
-                    except IntegrityError as err:
-                        self.print_msg(f"IntegrityError when processing {vm}, skip: {err}", "error")
-                        # Use SQL below to check:
-                        # SELECT * FROM public.virtualization_virtualmachine where primary_ip4_id=<IPAddress ID>
-                        continue
-
-                # Print stale VMs(possible)
-                cloud_vms = set([cloud_vm['name'] for cloud_vm in vms])
-                db_vms = set([db_vm.name for db_vm in VirtualMachine.objects.filter(cluster=cluster)])
-
-                if len(cloud_vms) > len(db_vms):
-                    print(f"🐛🐛🐛 STALE VMs: {cloud_vms - db_vms}")
+                vms = fetch_vms_form_inspur_cloud()
+                if vms:
+                    self.print_msg(f"🐛 Found {len(vms)} VMs from Inspur cloud, start to sync", "sucess")
+                    sync_inspur(vms, cluster)
                 else:
-                    print(f"🐛🐛🐛 STALE VMs: {db_vms - cloud_vms}")
-                
-                print(f"🐛🐛🐛 Result: Total: {len(vms)}, Created: {created_count}, Updated: {updated_count}, Ignored: {ignored_count}")
-
+                    self.print_msg(f"🐛 Found {len(vms)} VMs from Inspur cloud, skip", "warning")
+                    continue
             # 浪潮虚拟化之外的虚拟化同步逻辑
             else:
                 for device in cluster.devices.all():
                     if not device.name:
-                        self.print_msg(f"IP address not found in device name for device({device}) in cluster({cluster}), skip", "warning")
+                        self.print_msg(
+                            f"IP address not found in device name for device({device}) in cluster({cluster}), skip",
+                            "warning",
+                        )
                         continue
 
                     device_ip = extract_ip(device.name)
@@ -166,7 +65,10 @@ class Command(BaseCommand):
                     username = password = ""
                     username, password = get_auth_from_comments(device.comments)
                     if not username or not password:
-                        self.print_msg(f" Username or password not found in comments of device({device}) in cluster({cluster}), skip", "error")
+                        self.print_msg(
+                            f" Username or password not found in comments of device({device}) in cluster({cluster}), skip",
+                            "error",
+                        )
                         continue
 
                     self.print_msg(f"🐛 Sync VMs for device({device}) in cluster {cluster}")
@@ -206,7 +108,9 @@ class Command(BaseCommand):
                             vm_instance.device = device
                             vm_instance.save()
                         else:
-                            self.print_msg(f"🐛 Found {vm_in_db.count()} VMs in DB by search: {vm['name']}, skip", "warning")
+                            self.print_msg(
+                                f"🐛 Found {vm_in_db.count()} VMs in DB by search: {vm['name']}, skip", "warning"
+                            )
 
     def handle(self, *args, **options):
         # print(f"args: {args}")
@@ -219,7 +123,6 @@ class Command(BaseCommand):
         if not any(custom_options.values()):
             self.print_help('manage.py', 'sync_inspur')
             return
-
 
         if options["list"]:
             self.stdout.write(self.style.SUCCESS("Current Clusters:"))
