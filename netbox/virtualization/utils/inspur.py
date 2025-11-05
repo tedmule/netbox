@@ -8,7 +8,10 @@ from virtualization.models.clusters import Cluster
 from ipam.models import IPAddress
 
 
-def fetch_vms_form_inspur_cloud() -> list:
+def fetch_vms_form_inspur_cloud(page_size: int = 1000) -> dict:
+    """
+    return dict
+    """
     inspur_cloud_url = os.getenv('INSPUR_CLOUD_URL', 'https://localhost')
     inspur_cloud_access_key = os.getenv('INSPUR_CLOUD_ACCESS_KEY', 'access_key')
     inspur_cloud_access_secret = os.getenv('INSPUR_CLOUD_ACCESS_SECRET', 'access_secret')
@@ -24,24 +27,28 @@ def fetch_vms_form_inspur_cloud() -> list:
     if inspur_cloud_host:
         headers['Host'] = inspur_cloud_host
 
-    vms = []
+    vms = {}
     urllib3.disable_warnings()
 
     try:
         # resp = requests.get('https://192.168.20.35/vms?pageSize=1000&currentPage=1&sortField=&sort=desc',
         resp = requests.get(
-            f'{inspur_cloud_url}/vms?pageSize=1000&currentPage=1&sortField=&sort=desc', headers=headers, verify=False
+            f'{inspur_cloud_url}/vms?pageSize={page_size}&currentPage=1&sortField=&sort=desc',
+            headers=headers,
+            verify=False,
         )
         if resp.status_code == 200:
             data = resp.json()
             for vm in data['items']:
+                vm_id = vm['id']
                 info = {
-                    'id': vm["id"],
+                    # 'id': vm["id"],
                     'name': vm['name'],
                     'status': 'active' if vm['status'] == "STARTED" else "offline",
                     'vcpus': vm['cpuNum'],
                     'memory': vm['memory'],
                     'host': vm['hostIp'],
+                    'desc': vm['description'] if vm['description'] else '',
                 }
 
                 # 只获取配置了IP地址的虚拟机
@@ -57,69 +64,80 @@ def fetch_vms_form_inspur_cloud() -> list:
                     print(f"🐛NIC not found for VM {vm['name']}, skip")
                     continue
 
-                vms.append(info)
+                # vms.append(info)
+                vms[vm_id] = info
+
             return vms
         else:
             print(f"🐞 Invoke Inspur API error: status({resp.status_code}), response({resp.text})")
-            return []
+            return {}
     except requests.exceptions.ConnectionError as err:
         print(f"🐞 Connect Inspur API error: {str(err)}")
-        return []
+        return {}
 
 
-def sync_inspur(vms: list, cluster: Cluster):
+def sync_inspur(vms: dict, cluster: Cluster):
 
-    # Variable(tmp) to store vm instance in database
-    vm_inst = VirtualMachine()
     # counter
     updated_count = 0
     created_count = 0
-    ignored_list = []
+    skipped = []
 
-    for vm in vms:
+    vms_in_db = VirtualMachine.objects.filter(cluster=cluster)
+
+    vm_db_ids = set([vm.custom_field_data["cloud_vm_id"] for vm in vms_in_db])
+    cloud_vm_ids = set(vms.keys())
+
+    ids_to_delete = vm_db_ids - cloud_vm_ids
+    print(f"Netbox中需要删除的虚拟机({len(ids_to_delete)}):")
+    for vid in vm_db_ids - cloud_vm_ids:
+        print(f"{vid}, deleted")
+        try:
+            VirtualMachine.objects.get(custom_field_data__cloud_vm_id=vid).delete()
+        except VirtualMachine.MultipleObjectsReturned:
+            print(f"❌ {vid} return multiple objects when deleting, skip")
+
+    for vm_id, vm in vms.items():
+        # Get or create ip address for VM
+        vm_name = vm['name']
+        vm_ip = vm['ip']
         host_ip_address = f"{vm['host']}/24"
         try:
-            ip_obj = IPAddress.objects.get(address=host_ip_address)
-            interface = ip_obj.assigned_object
+            ipaddr, created = IPAddress.objects.get_or_create(address=vm_ip)
+        except IPAddress.MultipleObjectsReturned:
+            # Potential issue when there are 10.10.10.10/32 and 10.10.10.10/24 in database
+            ipaddr = IPAddress.objects.filter(address=vm_ip).first()
 
-            # 检查接口是否存在并且是否关联到物理设备
-            if interface and hasattr(interface, 'device'):
-                device = interface.device
+        try:
+            vm_in_db = VirtualMachine.objects.get(custom_field_data__cloud_vm_id=vm_id)
+            print(f"🐛 Found {vm_in_db.name} in DB by Inspur ID {vm_id}, UPDATE.")
 
-                # 以下为浪潮虚拟机添加逻辑
-                vm_name = vm['name']
-                vm_ip = vm['ip']
+            count = update_inspur_vm(vm_in_db, vm, ipaddr, vm_id)
+            updated_count += count
 
-                try:
-                    ipaddr, created = IPAddress.objects.get_or_create(address=vm_ip)
-                except IPAddress.MultipleObjectsReturned:
-                    # Potential issue when there are 10.10.10.10/32 and 10.10.10.10/24 in database
-                    ipaddr = IPAddress.objects.filter(address=vm_ip).first()
+        except VirtualMachine.DoesNotExist:
+            print(f"✔️  No VM found by Inspur ID {vm_id} (Inspur cloud name: {vm['name']}), CREATE")
 
-                # Try find by inspur cloud vm id
-                vm_in_db = VirtualMachine.objects.filter(custom_field_data__cloud_vm_id=vm["id"])
+            try:
+                ip_obj = IPAddress.objects.get(address=host_ip_address)
+                interface = ip_obj.assigned_object
 
-                if not vm_in_db:
-                    print(f"🚨 VM({vm['name']}, {vm['ip']}) not found by id {vm['id']}, use name/ip method")
-                    # Try find VM by name, ip address in description or ip address equals primary_ip4
-                    vm_in_db = VirtualMachine.objects.filter(
-                        Q(name__icontains=vm_name) | (Q(description=vm_ip) | Q(primary_ip4=ipaddr)),
-                        cluster=cluster,
-                        # Q(name__icontains=vm_name) &
-                        # Q(description__icontains=vm_ip) |
-                        # Q(primary_ip4=ipaddr),
-                        # cluster=cluster,
-                    )
-
-                if vm_in_db.count() == 0:
-                    print(f"✔️ Inspur cloud VM({vm_name}) with IP({vm_ip}) not found in DB, ADDING")
+                # 检查接口是否存在并且是否关联到物理设备
+                if interface and hasattr(interface, 'device'):
+                    device = interface.device
 
                     vm_instance = VirtualMachine()
                     vm_instance.name = vm_name
                     vm_instance.status = vm['status']
 
-                    # IP地址文本存放在描述里(临时兼容)
-                    vm_instance.description = vm_ip
+                    vm_instance.description = vm.get('desc', '')
+                    # IP地址文本存放在config_context的'_ip'字段里
+                    if not vm_instance.local_context_data:
+                        vm_instance.local_context_data = {}
+                        vm_instance.local_context_data['_ip'] = vm_ip
+                    else:
+                        vm_instance.local_context_data['_ip'] = vm_ip
+
                     vm_instance.primary_ip4 = ipaddr
 
                     if vm.get('vcpus', 0):
@@ -133,115 +151,180 @@ def sync_inspur(vms: list, cluster: Cluster):
                     vm_instance.device = device
 
                     # Bind vm to cloud vm id
-                    vm_instance.custom_field_data['cloud_vm_id'] = vm['id']
+                    vm_instance.custom_field_data['cloud_vm_id'] = vm_id
 
                     vm_instance.save()
                     created_count += 1
-
-                elif vm_in_db.count() > 1:
-                    print(
-                        f"🚨 Found multiple VMs(count: {vm_in_db.count()}) from netbox database by {vm_name}(IP: {vm_ip}), checking",
-                    )
-                    for item in vm_in_db:
-                        print(item.name)
-
-                    ignored = True
-                    ignored_vm_name = ""
-                    for dup_vm in vm_in_db:
-                        if (
-                            dup_vm.primary_ip4
-                            and (vm_ip == str(dup_vm.primary_ip4.address.ip))
-                            and vm_name == dup_vm.name
-                        ):
-                            print(f"Matched VM {dup_vm.name}(IP: {vm_ip}) by primary_ip4 ")
-                            count = update_inspur_vm(dup_vm, vm, ipaddr)
-                            updated_count += count
-                            ignored = False
-                            break
-                        elif vm_ip in dup_vm.description and vm_name == dup_vm.name:
-                            print(f"Matched VM {dup_vm.name}(IP: {vm_ip}) by description")
-                            count = update_inspur_vm(dup_vm, vm, ipaddr)
-                            updated_count += count
-                            ignored = False
-                            break
-
-                    if ignored:
-                        ignored_list.append(dup_vm.name)
                 else:
-                    # Found 1 VM from netbox database, update
-                    vm_inst = vm_in_db.first()
-                    count = update_inspur_vm(vm_inst, vm, ipaddr)
-                    updated_count += count
-            else:
-                print(f"Device with IP address({host_ip_address}) not found, skip")
-        except IPAddress.DoesNotExist:
-            print(f"Device IP address not found {host_ip_address}, skip")
-            continue
-        except KeyError as err:
-            print(f"KeyError when processing {vm}, skip")
-            continue
-        # except IntegrityError as err:
-        #     print(f"IntegrityError when processing {vm}, skip: {err}")
-        #     # Use SQL below to check:
-        #     # SELECT * FROM public.virtualization_virtualmachine where primary_ip4_id=<IPAddress ID>
-        #     continue
-
-    # Print stale VMs(possible)
-    cloud_vms = set([cloud_vm['name'] for cloud_vm in vms])
-    db_vms = set([db_vm.name for db_vm in VirtualMachine.objects.filter(cluster=cluster)])
-
-    if len(cloud_vms) > len(db_vms):
-        print(f"🐛🐛 STALE VMs: {cloud_vms - db_vms}")
-    else:
-        print(f"🐛🐛 STALE VMs: {db_vms - cloud_vms}")
+                    print(f"❌ Device with IP address({host_ip_address}) not found, skip")
+                    skipped.append(vm)
+                    continue
+            except IPAddress.DoesNotExist:
+                print(f"❌ Device IP address not found {host_ip_address}, skip")
+                skipped.append(vm)
+                continue
+            except KeyError as err:
+                print(f"❌ KeyError when processing {vm}, skip")
+                skipped.append(vm)
+                continue
 
     print(
-        f"🐛🐛 Result: Total: {len(vms)}, Created: {created_count}, Updated: {updated_count}, Ignored: {len(ignored_list)}"
+        f"🐛🐛🐛 Result: Total: {len(vms)}, Created: {created_count}, Updated: {updated_count}, Ignored: {len(skipped)}"
     )
-    for ig in ignored_list:
-        print(ig)
+    for skp in skipped:
+        print(skp)
+
+    # ================ 以下为旧添加逻辑，后期优化后删除 ================
+    # host_ip_address = f"{vm['host']}/24"
+    # try:
+    #    ip_obj = IPAddress.objects.get(address=host_ip_address)
+    #    interface = ip_obj.assigned_object
+
+    #    # 检查接口是否存在并且是否关联到物理设备
+    #    if interface and hasattr(interface, 'device'):
+    #        device = interface.device
+
+    #        # 以下为浪潮虚拟机添加逻辑
+    #        vm_name = vm['name']
+    #        vm_ip = vm['ip']
+
+    #        # Get or create ip address for VM
+    #        try:
+    #            ipaddr, created = IPAddress.objects.get_or_create(address=vm_ip)
+    #        except IPAddress.MultipleObjectsReturned:
+    #            # Potential issue when there are 10.10.10.10/32 and 10.10.10.10/24 in database
+    #            ipaddr = IPAddress.objects.filter(address=vm_ip).first()
+
+    #        # Try find VM by name, ip address in description or ip address equals primary_ip4
+    #        vm_in_db = VirtualMachine.objects.filter(
+    #            Q(name__icontains=vm_name) | (Q(description=vm_ip) | Q(primary_ip4=ipaddr)),
+    #            cluster=cluster,
+    #            # Q(name__icontains=vm_name) &
+    #            # Q(description__icontains=vm_ip) |
+    #            # Q(primary_ip4=ipaddr),
+    #            # cluster=cluster,
+    #        )
+
+    #        if vm_in_db.count() == 0:
+    #            print(f"✔️ Inspur cloud VM({vm_name}) with IP({vm_ip}) not found in DB, ADDING")
+
+    #            vm_instance = VirtualMachine()
+    #            vm_instance.name = vm_name
+    #            vm_instance.status = vm['status']
+
+    #            # IP地址文本存放在描述里(临时兼容)
+    #            vm_instance.description = vm_ip
+    #            # IP地址文本存放在config_context里(临时兼容)
+    #            vm_instance.local_context_data['_ip'] = vm_ip
+    #            vm_instance.primary_ip4 = ipaddr
+
+    #            if vm.get('vcpus', 0):
+    #                vm_instance.vcpus = vm['vcpus']
+    #            if vm.get('memory', 0):
+    #                vm_instance.memory = vm['memory']
+
+    #            vm_instance.cluster = cluster
+
+    #            # Bind vm to device(physical machine)
+    #            vm_instance.device = device
+
+    #            # Bind vm to cloud vm id
+    #            vm_instance.custom_field_data['cloud_vm_id'] = vm_id
+
+    #            vm_instance.save()
+    #            created_count += 1
+
+    #        elif vm_in_db.count() > 1:
+    #            print(
+    #                f"🚨 Found multiple VMs(count: {vm_in_db.count()}) from netbox database by {vm_name}(IP: {vm_ip}), checking",
+    #            )
+    #            for vm_item in vm_in_db:
+    #                print(vm_item.name)
+
+    #            ignored = True
+    #            ignored_vm_name = ""
+    #            for dup_vm in vm_in_db:
+    #                if (
+    #                    dup_vm.primary_ip4
+    #                    and (vm_ip == str(dup_vm.primary_ip4.address.ip))
+    #                    and vm_name == dup_vm.name
+    #                ):
+    #                    print(f"Matched VM {dup_vm.name}(IP: {vm_ip}) by primary_ip4 ")
+    #                    count = update_inspur_vm(dup_vm, vm, ipaddr, vm_id)
+    #                    updated_count += count
+    #                    ignored = False
+    #                    break
+    #                elif vm_ip in dup_vm.description and vm_name == dup_vm.name:
+    #                    print(f"Matched VM {dup_vm.name}(IP: {vm_ip}) by description")
+    #                    count = update_inspur_vm(dup_vm, vm, ipaddr, vm_id)
+    #                    updated_count += count
+    #                    ignored = False
+    #                    break
+
+    #            if ignored:
+    #                skipped.append(dup_vm.name)
+    #        else:
+    #            # Found 1 VM from netbox database, update
+    #            vm_inst = vm_in_db.first()
+    #            count = update_inspur_vm(vm_inst, vm, ipaddr, vm_id)
+    #            updated_count += count
+    #    else:
+    #        print(f"Device with IP address({host_ip_address}) not found, skip")
+    # except IPAddress.DoesNotExist:
+    #    print(f"Device IP address not found {host_ip_address}, skip")
+    #    continue
+    # except KeyError as err:
+    #    print(f"KeyError when processing {vm}, skip")
+    #    continue
+    # except IntegrityError as err:
+    #    print(f"IntegrityError when processing {vm}, skip: {err}")
+    #    # Use SQL below to check:
+    #    # SELECT * FROM public.virtualization_virtualmachine where primary_ip4_id=<IPAddress ID>
+    #    continue
+    # ================ 以上为旧添加逻辑，后期优化后删除 ================
 
 
-def update_inspur_vm(vm_inst: VirtualMachine, data: dict, ipaddr: IPAddress) -> int:
+def update_inspur_vm(vm_inst: VirtualMachine, vm_data: dict, ipaddr: IPAddress, vm_id: str) -> int:
     '''
     Return:
         1: updated
         0: no update
     '''
-    vm_name = data['name']
-    vm_ip = data['ip']
+    try:
+        vm_name = vm_data['name']
+        vm_ip = vm_data['ip']
 
-    update_flag = False
+        # Logic to update vm instance in database
+        # Update name
+        if vm_inst.name != vm_name:
+            print(
+                f"🐛 Name of VM({vm_inst.name}: {vm_inst.description}[Database]) is different from VM({vm_name}: {vm_ip}[Cloud]), update"
+            )
+            vm_inst.name = vm_name
 
-    # Logic to update vm instance in database
-    # Update name
-    if vm_inst.name != vm_name:
-        print(
-            f"🐛 Name of VM({vm_inst.name}: {vm_inst.description}[Database]) is different from VM({vm_name}: {vm_ip}[Cloud]), update"
-        )
-        vm_inst.name = vm_name
-        update_flag = True
+        # Update CPU/Mem
+        vm_inst.vcpus = vm_data['vcpus']
+        vm_inst.memory = vm_data['memory']
+        # Update description
+        vm_inst.description = vm_data.get('desc', '')
 
-    # Update IP
-    if vm_ip not in vm_inst.description:
-        print(f"🐛 Update VM({vm_inst.name}) description to '{vm_ip}'")
-        vm_inst.description = vm_ip
-        update_flag = True
+        # Update IP
+        if not vm_inst.local_context_data:
+            vm_inst.local_context_data = {}
+            vm_inst.local_context_data['_ip'] = vm_ip
+            print(f"🐛 Add IP({vm_ip}) to local_context_data for VM({vm_name})")
+        else:
+            vm_inst.local_context_data['_ip'] = vm_ip
+            print(f"🐛 update IP({vm_ip}) to local_context_data for VM({vm_name})")
 
-    if (not vm_inst.primary_ip4) or (vm_ip != str(vm_inst.primary_ip4.address.ip)):
-        vm_inst.primary_ip4 = ipaddr
-        print(f"🐛 Update VM({vm_inst.name}) primary_ip4 to '{vm_ip}'")
-        update_flag = True
+        if (not vm_inst.primary_ip4) or (vm_ip != str(vm_inst.primary_ip4.address.ip)):
+            vm_inst.primary_ip4 = ipaddr
+            print(f"🐛 Update VM({vm_inst.name}) primary_ip4 to '{vm_ip}'")
 
-    if not vm_inst.custom_field_data["cloud_vm_id"]:
-        print(f"🐛 Add cloud_vm_id({data['id']}) primary_ip4 to '{vm_inst.name}'")
-        vm_inst.custom_field_data["cloud_vm_id"] = data["id"]
-        update_flag = True
-
-    # Save to DB
-    if update_flag:
-        vm_inst.status = data['status']
+        # Save to DB
+        vm_inst.status = vm_data['status']
         vm_inst.save()
-        return 1
 
-    return 0
+        return 1
+    except Exception as err:
+        return 0
