@@ -323,17 +323,6 @@ def update_inspur_vm(vm_inst: VirtualMachine, vm_data: dict, ipaddr: IPAddress, 
             vm_inst.local_context_data['_ip'] = vm_ip
             print(f"🐛 update IP({vm_ip}) to local_context_data for VM({vm_name})")
 
-        if (not vm_inst.primary_ip4) or (vm_ip != str(vm_inst.primary_ip4.address.ip)):
-            # Avoid assigning an IP that's already primary for another VM by clearing it first
-            with transaction.atomic():
-                conflict_vm = VirtualMachine.objects.filter(primary_ip4=ipaddr).exclude(pk=vm_inst.pk).first()
-                if conflict_vm:
-                    conflict_vm.primary_ip4 = None
-                    conflict_vm.save()
-
-                vm_inst.primary_ip4 = ipaddr
-                print(f"🐛 Update VM({vm_inst.name}) primary_ip4 to '{vm_ip}'")
-
         # Save to DB
         vm_inst.status = vm_data['status']
         vm_inst.save()
