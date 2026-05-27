@@ -3,6 +3,7 @@ import urllib3
 import requests
 from django.db.models import Q
 from django.db.utils import IntegrityError
+from django.db import transaction
 from virtualization.models import VirtualMachine
 from virtualization.models.clusters import Cluster
 from ipam.models import IPAddress
@@ -98,15 +99,19 @@ def sync_inspur(vms: dict, cluster: Cluster):
             print(f"❌ {vid} return multiple objects when deleting, skip")
 
     for vm_id, vm in vms.items():
+        print(f"🐛 Processing VM {vm['name']} with Inspur ID {vm_id} in cluster {cluster}")
         # Get or create ip address for VM
         vm_name = vm['name']
         vm_ip = vm['ip']
         host_ip_address = f"{vm['host']}/24"
+        print(f"🐛 Host IP address for VM {vm_name} is {host_ip_address}, checking if device exists in Netbox")
         try:
             ipaddr, created = IPAddress.objects.get_or_create(address=vm_ip)
         except IPAddress.MultipleObjectsReturned:
             # Potential issue when there are 10.10.10.10/32 and 10.10.10.10/24 in database
             ipaddr = IPAddress.objects.filter(address=vm_ip).first()
+
+        print(f"🐛 IP address for VM {vm_name} is {ipaddr}, created: {created}")
 
         try:
             vm_in_db = VirtualMachine.objects.get(custom_field_data__cloud_vm_id=vm_id)
@@ -138,7 +143,8 @@ def sync_inspur(vms: dict, cluster: Cluster):
                     else:
                         vm_instance.local_context_data['_ip'] = vm_ip
 
-                    vm_instance.primary_ip4 = ipaddr
+                    # BUG: 先注释掉IP地址绑定，后续优化后添加
+                    # vm_instance.primary_ip4 = ipaddr
 
                     if vm.get('vcpus', 0):
                         vm_instance.vcpus = vm['vcpus']
@@ -318,8 +324,15 @@ def update_inspur_vm(vm_inst: VirtualMachine, vm_data: dict, ipaddr: IPAddress, 
             print(f"🐛 update IP({vm_ip}) to local_context_data for VM({vm_name})")
 
         if (not vm_inst.primary_ip4) or (vm_ip != str(vm_inst.primary_ip4.address.ip)):
-            vm_inst.primary_ip4 = ipaddr
-            print(f"🐛 Update VM({vm_inst.name}) primary_ip4 to '{vm_ip}'")
+            # Avoid assigning an IP that's already primary for another VM by clearing it first
+            with transaction.atomic():
+                conflict_vm = VirtualMachine.objects.filter(primary_ip4=ipaddr).exclude(pk=vm_inst.pk).first()
+                if conflict_vm:
+                    conflict_vm.primary_ip4 = None
+                    conflict_vm.save()
+
+                vm_inst.primary_ip4 = ipaddr
+                print(f"🐛 Update VM({vm_inst.name}) primary_ip4 to '{vm_ip}'")
 
         # Save to DB
         vm_inst.status = vm_data['status']
