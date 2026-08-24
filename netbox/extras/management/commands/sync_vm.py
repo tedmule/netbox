@@ -41,7 +41,7 @@ class Command(BaseCommand):
             if cluster_type == 'inspur':
                 vms = fetch_vms_form_inspur_cloud()
                 if vms:
-                    self.print_msg(f"🐛 Found {len(vms)} VMs from Inspur cloud, start to sync", "sucess")
+                    self.print_msg(f"🐛 Found {len(vms)} VMs from Inspur cloud, start to sync", "success")
                     sync_inspur(vms, cluster)
                 else:
                     self.print_msg(f"🐛 Found {len(vms)} VMs from Inspur cloud, skip", "warning")
@@ -80,7 +80,6 @@ class Command(BaseCommand):
                     elif cluster_type == "kvm":
                         vms = sync_kvm(device_ip, username, password)
 
-                    print(f"---vms: {vms}, {len(vms)}")
                     for vm in vms:
                         vm_in_db = VirtualMachine.objects.filter(cluster=cluster, name__contains=vm['name'])
                         if vm_in_db.count() == 0:

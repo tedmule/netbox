@@ -7,9 +7,41 @@ from django.db import transaction
 from virtualization.models import VirtualMachine
 from virtualization.models.clusters import Cluster
 from ipam.models import IPAddress
+from virtualization.utils.util import extract_ip
 
 
-def fetch_vms_form_inspur_cloud(page_size: int = 1000) -> dict:
+def _fill_vm_info(vm_data: list) -> dict:
+    vms = {}
+    for vm in vm_data:
+        vm_id = vm['id']
+        info = {
+            # 'id': vm["id"],
+            'name': vm['name'],
+            'status': 'active' if vm['status'] == "STARTED" else "offline",
+            'vcpus': vm['cpuNum'],
+            'memory': vm['memory'],
+            'host': vm['hostIp'],
+            'desc': vm['description'] if vm['description'] else '',
+        }
+
+        # 只获取配置了IP地址的虚拟机
+        if len(vm['nics']) > 0:
+            ip_text = vm['nics'][0]['ip']
+
+            if ip_text:
+                info['ip'] = ip_text.split(',')[0]
+            else:
+                print(f"🐛 IP address not found for VM {vm['name']}, set ip string empty")
+                info['ip'] = ""
+        else:
+            print(f"🐛NIC not found for VM {vm['name']}, skip")
+            continue
+
+        vms[vm_id] = info
+    return vms
+
+
+def fetch_vms_form_inspur_cloud(page_size: int = 100) -> dict:
     """
     return dict
     """
@@ -29,49 +61,37 @@ def fetch_vms_form_inspur_cloud(page_size: int = 1000) -> dict:
         headers['Host'] = inspur_cloud_host
 
     vms = {}
+    current_page = 1
     urllib3.disable_warnings()
 
     try:
         # resp = requests.get('https://192.168.20.35/vms?pageSize=1000&currentPage=1&sortField=&sort=desc',
         resp = requests.get(
-            f'{inspur_cloud_url}/vms?pageSize={page_size}&currentPage=1&sortField=&sort=desc',
+            f'{inspur_cloud_url}/vms?pageSize={page_size}&currentPage={current_page}&sortField=&sort=desc',
             headers=headers,
             verify=False,
         )
         if resp.status_code == 200:
             data = resp.json()
-            for vm in data['items']:
-                vm_id = vm['id']
-                info = {
-                    # 'id': vm["id"],
-                    'name': vm['name'],
-                    'status': 'active' if vm['status'] == "STARTED" else "offline",
-                    'vcpus': vm['cpuNum'],
-                    'memory': vm['memory'],
-                    'host': vm['hostIp'],
-                    'desc': vm['description'] if vm['description'] else '',
-                }
-
-                # 只获取配置了IP地址的虚拟机
-                if len(vm['nics']) > 0:
-                    ip_text = vm['nics'][0]['ip']
-
-                    if ip_text:
-                        info['ip'] = ip_text.split(',')[0]
-                    else:
-                        print(f"🐛 IP address not found for VM {vm['name']}, ignore")
-                        continue
+            vm_dict = _fill_vm_info(data['items'])
+            vms |= vm_dict
+            while current_page < data['totalPage']:
+                current_page += 1
+                resp = requests.get(
+                    f'{inspur_cloud_url}/vms?pageSize={page_size}&currentPage={current_page}&sortField=&sort=desc',
+                    headers=headers,
+                    verify=False,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    vm_dict = _fill_vm_info(data['items'])
+                    vms |= vm_dict
                 else:
-                    print(f"🐛NIC not found for VM {vm['name']}, skip")
-                    continue
-
-                # vms.append(info)
-                vms[vm_id] = info
-
+                    print(f"🐞 Invoke Inspur API error: status({resp.status_code}), response({resp.text})")
             return vms
         else:
             print(f"🐞 Invoke Inspur API error: status({resp.status_code}), response({resp.text})")
-            return {}
+            return vms
     except requests.exceptions.ConnectionError as err:
         print(f"🐞 Connect Inspur API error: {str(err)}")
         return {}
@@ -102,22 +122,26 @@ def sync_inspur(vms: dict, cluster: Cluster):
         print(f"🐛 Processing VM {vm['name']} with Inspur ID {vm_id} in cluster {cluster}")
         # Get or create ip address for VM
         vm_name = vm['name']
-        vm_ip = vm['ip']
-        host_ip_address = f"{vm['host']}/24"
-        print(f"🐛 Host IP address for VM {vm_name} is {host_ip_address}, checking if device exists in Netbox")
-        try:
-            ipaddr, created = IPAddress.objects.get_or_create(address=vm_ip)
-        except IPAddress.MultipleObjectsReturned:
-            # Potential issue when there are 10.10.10.10/32 and 10.10.10.10/24 in database
-            ipaddr = IPAddress.objects.filter(address=vm_ip).first()
 
-        print(f"🐛 IP address for VM {vm_name} is {ipaddr}, created: {created}")
+        vm_ip = vm['ip']
+
+        host_ip_address = f"{vm['host']}/24"
+        print(f"Host IP address for VM {vm_name} is {host_ip_address}, checking if device exists in Netbox")
+
+        if vm_ip:
+            try:
+                ipaddr, created = IPAddress.objects.get_or_create(address=vm_ip)
+                print(f"IP address for VM {vm_name} is {ipaddr}, created: {created}")
+            except IPAddress.MultipleObjectsReturned:
+                # Potential issue when there are 10.10.10.10/32 and 10.10.10.10/24 in database
+                ipaddr = IPAddress.objects.filter(address=vm_ip).first()
+                print(f"Reuse first IP address({ipaddr})for VM {vm_name}")
 
         try:
             vm_in_db = VirtualMachine.objects.get(custom_field_data__cloud_vm_id=vm_id)
-            print(f"🐛 Found {vm_in_db.name} in DB by Inspur ID {vm_id}, UPDATE.")
+            print(f"Found {vm_in_db.name} in DB by Inspur ID {vm_id}, UPDATE.")
 
-            count = update_inspur_vm(vm_in_db, vm, ipaddr, vm_id)
+            count = update_inspur_vm(vm_in_db, vm)
             updated_count += count
 
         except VirtualMachine.DoesNotExist:
@@ -290,7 +314,7 @@ def sync_inspur(vms: dict, cluster: Cluster):
     # ================ 以上为旧添加逻辑，后期优化后删除 ================
 
 
-def update_inspur_vm(vm_inst: VirtualMachine, vm_data: dict, ipaddr: IPAddress, vm_id: str) -> int:
+def update_inspur_vm(vm_inst: VirtualMachine, vm_data: dict) -> int:
     '''
     Return:
         1: updated
@@ -314,14 +338,16 @@ def update_inspur_vm(vm_inst: VirtualMachine, vm_data: dict, ipaddr: IPAddress, 
         # Update description
         vm_inst.description = vm_data.get('desc', '')
 
-        # Update IP
-        if not vm_inst.local_context_data:
-            vm_inst.local_context_data = {}
-            vm_inst.local_context_data['_ip'] = vm_ip
-            print(f"🐛 Add IP({vm_ip}) to local_context_data for VM({vm_name})")
-        else:
-            vm_inst.local_context_data['_ip'] = vm_ip
-            print(f"🐛 update IP({vm_ip}) to local_context_data for VM({vm_name})")
+        # Update IP address in local_context_data
+        if vm_ip:
+            # Update IP
+            if not vm_inst.local_context_data:
+                vm_inst.local_context_data = {}
+                vm_inst.local_context_data['_ip'] = vm_ip
+                print(f"Add IP({vm_ip}) to local_context_data for VM({vm_name})")
+            else:
+                vm_inst.local_context_data['_ip'] = vm_ip
+                print(f"update IP({vm_ip}) to local_context_data for VM({vm_name})")
 
         # Save to DB
         vm_inst.status = vm_data['status']
